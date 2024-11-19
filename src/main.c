@@ -33,7 +33,7 @@
 #define HTTP_HDR_END		"\r\n\r\n"
 
 #define RECV_BUF_SIZE		2048
-#define TLS_SEC_TAG		42
+#define TLS_SEC_TAG		123
 
 /* Macros used to subscribe to specific Zephyr NET management events. */
 #define L4_EVENT_MASK		(NET_EVENT_L4_CONNECTED | NET_EVENT_L4_DISCONNECTED)
@@ -325,11 +325,11 @@ int main(void)
 		return err;
 	}
 
-	 /* Provision certificates before connecting to the network */
-	err = cert_provision();
-	if (err) {
-		return 0;
-	}
+	//  /* Provision certificates before connecting to the network */
+	// err = cert_provision();
+	// if (err) {
+	// 	return 0;
+	// }
 
 	printk("Connecting to the network\n");
 
@@ -349,8 +349,8 @@ int main(void)
 		conn_mgr_mon_resend_status();
 	}
 
-	k_sem_take(&network_connected_sem, K_FOREVER);
-
+	k_sem_take(&network_connected_sem, K_SECONDS(10));
+	printk("after net sem\n");
 	send_http_request();
 
 	/* A small delay for the TCP connection teardown */
