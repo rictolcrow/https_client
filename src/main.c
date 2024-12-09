@@ -12,6 +12,9 @@
 #include <zephyr/net/conn_mgr_connectivity.h>
 #include <zephyr/net/tls_credentials.h>
 
+#include <modem/nrf_modem_lib.h>
+#include <modem/lte_lc.h>
+
 #if defined(CONFIG_POSIX_API)
 #include <zephyr/posix/arpa/inet.h>
 #include <zephyr/posix/netdb.h>
@@ -35,10 +38,6 @@
 #define RECV_BUF_SIZE		2048
 #define TLS_SEC_TAG		123
 
-/* Macros used to subscribe to specific Zephyr NET management events. */
-#define L4_EVENT_MASK		(NET_EVENT_L4_CONNECTED | NET_EVENT_L4_DISCONNECTED)
-#define CONN_LAYER_EVENT_MASK	(NET_EVENT_CONN_IF_FATAL_ERROR)
-
 static const char send_buf[] = HTTP_HEAD;
 static char recv_buf[RECV_BUF_SIZE];
 static K_SEM_DEFINE(network_connected_sem, 0, 1);
@@ -51,10 +50,6 @@ static const char cert[] = {
 	 */
 	IF_ENABLED(CONFIG_TLS_CREDENTIALS, (0x00))
 };
-
-/* Zephyr NET management event callback structures. */
-static struct net_mgmt_event_callback l4_cb;
-static struct net_mgmt_event_callback conn_cb;
 
 BUILD_ASSERT(sizeof(cert) < KB(4), "Certificate too large");
 
@@ -166,41 +161,27 @@ int tls_setup(int fd)
 	return 0;
 }
 
-static void on_net_event_l4_disconnected(void)
+static void lte_lc_handler(const struct lte_lc_evt *const evt)
 {
-	printk("Disconnected from the network\n");
-}
+	static bool connected;
 
-static void on_net_event_l4_connected(void)
-{
-	k_sem_give(&network_connected_sem);
-}
+	switch (evt->type) {
+	case LTE_LC_EVT_NW_REG_STATUS:
+		if ((evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_HOME) &&
+		    (evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_ROAMING)) {
+			if (!connected) {
+				break;
+			}
 
-static void l4_event_handler(struct net_mgmt_event_callback *cb,
-			     uint32_t event,
-			     struct net_if *iface)
-{
-	switch (event) {
-	case NET_EVENT_L4_CONNECTED:
-		printk("Network connectivity established and IP address assigned\n");
-		on_net_event_l4_connected();
-		break;
-	case NET_EVENT_L4_DISCONNECTED:
-		printk("Network connectivity lost\n");
-		on_net_event_l4_disconnected();
+			printk("LTE network is disconnected.\n");
+			connected = false;
+			break;
+		}
+		connected = true;
+		k_sem_give(&network_connected_sem);
 		break;
 	default:
 		break;
-	}
-}
-
-static void connectivity_event_handler(struct net_mgmt_event_callback *cb,
-				       uint32_t event,
-				       struct net_if *iface)
-{
-	if (event == NET_EVENT_CONN_IF_FATAL_ERROR) {
-		printk("Fatal error received from the connectivity layer\n");
-		return;
 	}
 }
 
@@ -306,65 +287,31 @@ int main(void)
 
 	printk("HTTPS client sample started\n\r");
 
-	/* Setup handler for Zephyr NET Connection Manager events. */
-	net_mgmt_init_event_callback(&l4_cb, l4_event_handler, L4_EVENT_MASK);
-	net_mgmt_add_event_callback(&l4_cb);
-
-	/* Setup handler for Zephyr NET Connection Manager Connectivity layer. */
-	net_mgmt_init_event_callback(&conn_cb, connectivity_event_handler, CONN_LAYER_EVENT_MASK);
-	net_mgmt_add_event_callback(&conn_cb);
-
-	printk("Bringing network interface up\n");
-
-	/* Connecting to the configured connectivity layer.
-	 * Wi-Fi or LTE depending on the board that the sample was built for.
-	 */
-	err = conn_mgr_all_if_up(true);
+	err = nrf_modem_lib_init();
+	if (err < 0) {
+		printk("Failed to initialize modem library!\n");
+		return err;
+	}
+	
+	err = cert_provision();
 	if (err) {
-		printk("conn_mgr_all_if_up, error: %d\n", err);
+		printk("Could not provision root CA to %d", TLS_SEC_TAG);
 		return err;
 	}
 
-	//  /* Provision certificates before connecting to the network */
-	// err = cert_provision();
-	// if (err) {
-	// 	return 0;
-	// }
-
-	printk("Connecting to the network\n");
-
-	err = conn_mgr_all_if_connect(true);
+	printk("LTE Link Connecting ...\n");
+	err = lte_lc_connect_async(lte_lc_handler);
 	if (err) {
-		printk("conn_mgr_all_if_connect, error: %d\n", err);
-		return 0;
+		printk("LTE link could not be established.");
+		return err;
 	}
 
-	/* Resend connection status if the sample is built for NATIVE_SIM.
-	 * This is necessary because the network interface is automatically brought up
-	 * at SYS_INIT() before main() is called.
-	 * This means that NET_EVENT_L4_CONNECTED fires before the
-	 * appropriate handler l4_event_handler() is registered.
-	 */
-	if (IS_ENABLED(CONFIG_BOARD_NATIVE_SIM)) {
-		conn_mgr_mon_resend_status();
-	}
-
-	k_sem_take(&network_connected_sem, K_SECONDS(10));
+	k_sem_take(&network_connected_sem, K_FOREVER);
 	printk("after net sem\n");
-	send_http_request();
-
-	/* A small delay for the TCP connection teardown */
-	k_sleep(K_SECONDS(1));
-
-	/* The HTTP transaction is done, take the network connection down */
-	err = conn_mgr_all_if_disconnect(true);
-	if (err) {
-		printk("conn_mgr_all_if_disconnect, error: %d\n", err);
-	}
-
-	err = conn_mgr_all_if_down(true);
-	if (err) {
-		printk("conn_mgr_all_if_down, error: %d\n", err);
+	
+	while(1) {
+		send_http_request();
+		k_sleep(K_SECONDS(30));
 	}
 
 	return 0;
